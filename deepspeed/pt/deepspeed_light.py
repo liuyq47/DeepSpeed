@@ -32,7 +32,17 @@ from deepspeed.pt.deepspeed_constants import \
 import deepspeed.pt.deepspeed_lr_schedules as lr_schedules
 from deepspeed.pt.deepspeed_csr_tensor import CSRTensor
 
+import herring.torch as herring
+import herringcommon as hm
+from torch.autograd import Variable
+
+dist.get_world_size = herring.get_world_size
+dist.get_rank = herring.get_rank
+dist.is_initialized = lambda: True
+dist.broadcast = herring.broadcast
+
 MEMORY_OPT_ALLREDUCE_SIZE = 500000000
+BUCKET_SIZE = 50*1024*1024
 SUMMARY_WRITER_DIR_NAME = "JobId"
 
 try:
@@ -49,6 +59,15 @@ except ImportError:
     from torch._utils import _flatten_dense_tensors as flatten
     from torch._utils import _unflatten_dense_tensors as unflatten
 
+ptToHerringDType = {
+    torch.float16: hm.herringFloat16,
+    torch.float32: hm.herringFloat32,
+    torch.float64: hm.herringFloat64,
+    torch.uint8: hm.herringUInt8,
+    torch.int8: hm.herringInt8,
+    torch.int32: hm.herringInt32,
+    torch.int64: hm.herringInt64
+}
 
 def split_half_float_double_csr(tensors):
     dtypes = [
@@ -121,21 +140,21 @@ class DeepSpeedLight(Module):
         self.warn_unscaled_loss = True
         self.config_params = config_params
 
-        if dist_init_required is None:
-            dist_init_required = not dist.is_initialized()
+        #if dist_init_required is None:
+        #    dist_init_required = not dist.is_initialized()
 
-        self._mpi_check(args, dist_init_required)
+        #self._mpi_check(args, dist_init_required)
 
-        self.dist_backend = "nccl"
-        if dist_init_required:
-            if not dist.is_initialized():
-                logger.info("Initializing torch distributed with backend: {}".format(
-                    self.dist_backend))
-                dist.init_process_group(backend=self.dist_backend)
-            else:
-                logger.warning(
-                    "Was given dist_init_required=True but detected that torch"
-                    "distributed was already initialized, cannot initialize twice.")
+        #self.dist_backend = "nccl"
+        # if dist_init_required:
+        #     if not dist.is_initialized():
+        #         logger.info("Initializing torch distributed with backend: {}".format(
+        #             self.dist_backend))
+        #         dist.init_process_group(backend=self.dist_backend)
+        #     else:
+        #         logger.warning(
+        #             "Was given dist_init_required=True but detected that torch"
+        #             "distributed was already initialized, cannot initialize twice.")
 
         self._do_args_sanity_check(args)
         self._configure_with_arguments(args, mpu)
@@ -145,10 +164,39 @@ class DeepSpeedLight(Module):
         if self.tensorboard_enabled():
             self.summary_writer = self.get_summary_writer()
 
+
         self._init_distributed(dist_init_required)
 
         # Configure distributed model
         self._configure_distributed_model(model)
+
+        #herring DDP init:
+        hm.setBucketSize(BUCKET_SIZE)
+        # Register hook to receive grtadients when they are computed
+        i = 0
+        for param in self.module.parameters():
+            if param.requires_grad:
+                param.register_hook(lambda grad, index=i: self._allreduce_hook(index, grad))
+                i += 1
+        self._numGrads = i
+        # Broadcast parameters to make sure all devices have the same params to begin with
+        for _, param in enumerate(self.module.parameters()):
+            self._broadcast(param)
+
+        # To store request object returned by Herring
+        self._requests = {}
+
+        # To make sure we only register one final callback per iteration
+        self._final_callback_registered = False
+
+        # Temporary store for AllReduce results
+        # TODO: Remove this additional space. Tmp results can be stored in fusion buffer
+        self._tmpGrads = [torch.empty(param.shape) for param in self.module.parameters() if param.requires_grad]
+
+        _num_nodes = int(hm.size() / hm.localSize())
+        self._is_single_node = True if 'HERRING_USE_SINGLENODE' in os.environ and \
+                                        int(os.environ.get('HERRING_USE_SINGLENODE')) == 1 and \
+                                       _num_nodes == 1 else False
 
         # Configure wall clock timer
         self.timers = SynchronizedWallClockTimer()
@@ -455,7 +503,8 @@ class DeepSpeedLight(Module):
             self.module.half()
         self.module.to(self.device)
         if self.mpu is None:
-            self.data_parallel_group = _initialize_parameter_parallel_groups()
+            #not needed when using herring
+            #self.data_parallel_group = _initialize_parameter_parallel_groups()
             self.dp_world_size = dist.get_world_size()
             src_rank = 0
         else:
@@ -463,9 +512,10 @@ class DeepSpeedLight(Module):
             self.dp_world_size = self.mpu.get_data_parallel_world_size()
             src_rank = _get_global_rank(self.mpu.get_data_parallel_group(), 0)
             logger.info(f"global src_rank={src_rank}")
-        for p in self.module.parameters():
-            if torch.is_tensor(p):
-                dist.broadcast(p, src_rank, group=self.data_parallel_group)
+        # not needed, herring already does this
+        # for p in self.module.parameters():
+        #     if torch.is_tensor(p):
+        #         dist.broadcast(p, src_rank, group=self.data_parallel_group)
 
         # TODO: support new AMP optimizer
         # self.module.half()
@@ -688,11 +738,59 @@ class DeepSpeedLight(Module):
             self.tput_timer.start()
         loss = self.module(*inputs, **kwargs)
 
+        #herring
+        self._final_callback_registered = False
+
         if self.wall_clock_breakdown():
             self.timers('forward').stop()
             self.timers('forward_microstep').stop()
 
         return loss
+
+    def _final_hook(self, index):
+        trainable_params = [param for param in self.module.parameters() if param.requires_grad]
+        # TODO: Copy in the order results become available
+        for i in range(len(trainable_params)):
+            hm.wait(self._requests[i])
+            trainable_params[i].grad = self._tmpGrads[i]
+
+    def _allreduce_hook(self, index, grad):
+        # '=None' is essential
+        # Assigning tensor to tensor will introduce temporal dependencies
+        self._tmpGrads[index] = None;
+        self._tmpGrads[index] = grad / hm.size()
+
+        torch.cuda.synchronize()
+
+        # Do OOB All Reduce as a fallback to NCCL
+        if self._is_single_node:
+            result = hm.oobAllReduce(self._tmpGrads[index].data_ptr(),
+                                     ptToHerringDType[self._tmpGrads[index].dtype],
+                                     self._tmpGrads[index].numel())
+
+        else:
+            # Do Herring all reduce
+            result = hm.allReduce(self._tmpGrads[index].data_ptr(),
+                                  self._tmpGrads[index].data_ptr(),
+                                  ptToHerringDType[self._tmpGrads[index].dtype],
+                                  grad.numel(),
+                                  index,
+                                  self._numGrads)
+
+        # Queue a final callback after the backward pass is done
+        if not self._final_callback_registered:
+            Variable._execution_engine.queue_callback(lambda i=index: self._final_hook(i))
+            self._final_callback_registered = True
+
+        # Store the request so we can wait for it in the final callback
+        self._requests[index] = result.request
+
+    def _broadcast(self, grad, rootRank=0):
+        result = hm.broadcast(grad.data_ptr(),
+                              ptToHerringDType[grad.dtype],
+                              grad.numel(),
+                              rootRank)
+        hm.wait(result.request)
 
     def allreduce_gradients(self, bucket_size=MEMORY_OPT_ALLREDUCE_SIZE):
         if self.is_gradient_accumulation_boundary():
@@ -765,8 +863,9 @@ class DeepSpeedLight(Module):
             self.timers('backward_allreduce_microstep').start()
             self.timers('backward_allreduce').start()
 
-        if allreduce_gradients:
-            self.allreduce_gradients()
+        # herring will be doing this:
+        # if allreduce_gradients:
+        #     self.allreduce_gradients()
 
         if self.wall_clock_breakdown():
             self.timers('backward_allreduce').stop()
