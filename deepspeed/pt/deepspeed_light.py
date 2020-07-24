@@ -35,6 +35,7 @@ from deepspeed.pt.deepspeed_csr_tensor import CSRTensor
 import herring.torch as herring
 import herringcommon as hm
 from torch.autograd import Variable
+import time
 
 dist.get_world_size = herring.get_world_size
 dist.get_rank = herring.get_rank
@@ -44,6 +45,7 @@ dist.broadcast = herring.broadcast
 MEMORY_OPT_ALLREDUCE_SIZE = 500000000
 BUCKET_SIZE = 50*1024*1024
 SUMMARY_WRITER_DIR_NAME = "JobId"
+start_time = time.time()
 
 try:
     from apex_C import flatten
@@ -445,8 +447,8 @@ class DeepSpeedLight(Module):
         if self.local_rank >= 0:
             torch.cuda.set_device(self.local_rank)
             self.device = torch.device("cuda", self.local_rank)
-            self.world_size = dist.get_world_size()
-            self.global_rank = dist.get_rank()
+            self.world_size = herring.get_world_size()
+            self.global_rank = herring.get_rank()
             logger.info("Set device to local rank {} within node.".format(
                 self.local_rank))
         else:
@@ -753,14 +755,23 @@ class DeepSpeedLight(Module):
         for i in range(len(trainable_params)):
             hm.wait(self._requests[i])
             trainable_params[i].grad = self._tmpGrads[i]
+        if self.wall_clock_breakdown():
+            self.timers('backward_allreduce_microstep').stop()
+            self.timers('backward_allreduce').stop()
+
 
     def _allreduce_hook(self, index, grad):
         # '=None' is essential
         # Assigning tensor to tensor will introduce temporal dependencies
+        
         self._tmpGrads[index] = None;
         self._tmpGrads[index] = grad / hm.size()
 
         torch.cuda.synchronize()
+        if index == (self._numGrads -1):
+            if self.wall_clock_breakdown():
+                self.timers('backward_allreduce_microstep').start()
+                self.timers('backward_allreduce').start()
 
         # Do OOB All Reduce as a fallback to NCCL
         if self._is_single_node:
@@ -858,18 +869,11 @@ class DeepSpeedLight(Module):
         if self.wall_clock_breakdown():
             self.timers('backward_inner').stop()
             self.timers('backward_inner_microstep').stop()
-
-        if self.wall_clock_breakdown():
-            self.timers('backward_allreduce_microstep').start()
-            self.timers('backward_allreduce').start()
-
         # herring will be doing this:
         # if allreduce_gradients:
         #     self.allreduce_gradients()
 
         if self.wall_clock_breakdown():
-            self.timers('backward_allreduce').stop()
-            self.timers('backward_allreduce_microstep').stop()
             self.timers('backward').stop()
             self.timers('backward_microstep').stop()
 
@@ -1266,33 +1270,35 @@ class DeepSpeedLight(Module):
 
         #This is to make sure the checkpoint names are created without collision
         #There seems to be issue creating them in parallel
-        self._create_checkpoint_files(save_dir, tag)
+       
+        if self.global_rank ==0:
+            self._create_checkpoint_files(save_dir, tag)
+            logger.info("ACTUALLY SAVING")
+            if self.save_non_zero_checkpoint:
+                self._save_checkpoint(save_dir, tag, client_state=client_state)
 
-        if self.save_non_zero_checkpoint:
-            self._save_checkpoint(save_dir, tag, client_state=client_state)
-
-        if self.save_zero_checkpoint:
-            self._save_zero_checkpoint(save_dir, tag)
+            if self.save_zero_checkpoint:
+                self._save_zero_checkpoint(save_dir, tag)
 
         return True
 
     def _create_checkpoint_files(self, save_dir, tag):
         #checkpoint files are created sequentially
-        for rank in range(self.world_size):
-            if rank == self.global_rank:
-                try:
-                    if self.save_non_zero_checkpoint:
-                        checkpoint_name = self._get_ckpt_name(save_dir, tag)
-                        self._ensure_directory_exists(checkpoint_name)
+        #for rank in range(self.world_size):
+        #if self.global_rank == 0:
+        try:
+            if self.save_non_zero_checkpoint:
+                    checkpoint_name = self._get_ckpt_name(save_dir, tag)
+                    self._ensure_directory_exists(checkpoint_name)
 
-                    if self.save_zero_checkpoint:
-                        checkpoint_name = self._get_zero_ckpt_name(save_dir, tag)
-                        self._ensure_directory_exists(checkpoint_name)
-                except:
-                    logger.error(
-                        f'Failed Saving model checkpoint to {save_dir} with tag {tag}')
-                    return False
-            dist.barrier()
+            if self.save_zero_checkpoint:
+                    checkpoint_name = self._get_zero_ckpt_name(save_dir, tag)
+                    self._ensure_directory_exists(checkpoint_name)
+        except:
+            logger.error(
+                f'Failed Saving model checkpoint to {save_dir} with tag {tag}')
+            return False
+            #dist.barrier()
 
     def _save_checkpoint(self, save_dir, tag, client_state={}):
 
