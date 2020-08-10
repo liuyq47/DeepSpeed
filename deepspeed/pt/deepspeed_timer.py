@@ -8,6 +8,11 @@ import torch
 
 from deepspeed.pt.log_utils import logger
 
+import herring.torch as herring
+
+torch.distributed.is_initialized = lambda: True
+torch.distributed.get_rank = herring.get_rank
+
 
 def print_rank_0(message):
     if torch.distributed.is_initialized():

@@ -103,6 +103,7 @@ def initialize(args,
 
     return_items = [
         engine,
+        engine.module,
         engine.optimizer,
         engine.training_dataloader,
         engine.lr_scheduler
