@@ -22,7 +22,7 @@ from deepspeed.pt.fp16_optimizer import FP16_Optimizer
 from deepspeed.pt.fp16_unfused_optimizer import FP16_UnfusedOptimizer
 from deepspeed.pt.deepspeed_fused_lamb import FusedLamb
 from deepspeed.pt.deepspeed_config import DeepSpeedConfig, \
-    ADAM_OPTIMIZER, LAMB_OPTIMIZER, DEEPSPEED_OPTIMIZERS
+    ADAM_OPTIMIZER, LAMB_OPTIMIZER, LANS_OPTIMIZER, DEEPSPEED_OPTIMIZERS
 
 from deepspeed.pt.deepspeed_dataloader import DeepSpeedDataLoader
 from deepspeed.pt.deepspeed_constants import \
@@ -537,6 +537,9 @@ class DeepSpeedLight(Module):
             optimizer = FusedAdam(model_parameters, **optimizer_parameters)
         elif self.optimizer_name() == LAMB_OPTIMIZER:
             optimizer = FusedLamb(model_parameters, **optimizer_parameters)
+        elif self.optimizer_name() == LANS_OPTIMIZER:
+            from apex.optimizers import FusedNesLAMB
+            optimizer = FusedNesLAMB(model_parameters, **optimizer_parameters)
         else:
             torch_optimizer = getattr(torch.optim, self.optimizer_name())
             optimizer = torch_optimizer(model_parameters, **optimizer_parameters)
