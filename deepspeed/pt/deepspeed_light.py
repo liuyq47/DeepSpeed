@@ -456,7 +456,7 @@ class DeepSpeedLight(Module):
             assert self.client_model_parameters, \
                 'DeepSpeed {} optimizer requires parameters in initialize() call'.format(self.optimizer_name())
 
-        if self.optimizer_name() == LAMB_OPTIMIZER:
+        if self.optimizer_name() == LAMB_OPTIMIZER or self.optimizer_name() == LANS_OPTIMIZER:
             assert self.dynamic_loss_scale(), \
                 'DeepSpeed {} optimizer requires dynamic loss scaling'.format(self.optimizer_name())
 
@@ -518,6 +518,13 @@ class DeepSpeedLight(Module):
             amp_params = self.amp_params()
             logger.info(f"Initializing AMP with these params: {amp_params}")
             self.module, self.optimizer = amp.initialize(self.module, basic_optimizer, **amp_params)
+            #if phase1:
+            if self.train_batch_size() >=32:
+                logger.info(f"Configuring phase 1 loss scale")
+                amp._amp_state.loss_scalers[0]._loss_scale = 2**13
+            else:
+                logger.info(f"Configuring phase 2 loss scale")
+                amp._amp_state.loss_scalers[0]._loss_scale = 2**10
             self._broadcast_model()
         elif self.fp16_enabled():
             self.optimizer = self._configure_fp16_optimizer(basic_optimizer)
