@@ -32,6 +32,9 @@ from deepspeed.pt.deepspeed_constants import \
 
 import deepspeed.pt.deepspeed_lr_schedules as lr_schedules
 from deepspeed.pt.deepspeed_csr_tensor import CSRTensor
+import herring.torch as herring
+
+dist.is_initialized = lambda: True
 
 import herring.torch as herring
 dist.is_initialized = lambda: True
@@ -130,8 +133,13 @@ class DeepSpeedLight(Module):
         if dist_init_required is None:
             dist_init_required = not dist.is_initialized()
 
+<<<<<<< HEAD
         # self._mpi_check(args, dist_init_required)
         #
+=======
+        #self._mpi_check(args, dist_init_required)
+
+>>>>>>> c8c6ac3d83a74a2aee9958f804545f2d4cc8a278
         # self.dist_backend = "nccl"
         # if dist_init_required:
         #     if not dist.is_initialized():
@@ -478,7 +486,11 @@ class DeepSpeedLight(Module):
 
         if self.mpu is None:
             #self.data_parallel_group = _initialize_parameter_parallel_groups()
+<<<<<<< HEAD
             self.dp_world_size = dist.get_world_size()
+=======
+            self.dp_world_size = herring.get_world_size()
+>>>>>>> c8c6ac3d83a74a2aee9958f804545f2d4cc8a278
             self.mp_world_size = 1
             self.broadcast_src_rank = 0
         else:
@@ -490,8 +502,13 @@ class DeepSpeedLight(Module):
                 0)
             logger.info(f"global src_rank={self.broadcast_src_rank}")
 
+<<<<<<< HEAD
         # if not self.amp_enabled():
         #     self._broadcast_model()
+=======
+        #if not self.amp_enabled():
+        #    self._broadcast_model()
+>>>>>>> c8c6ac3d83a74a2aee9958f804545f2d4cc8a278
 
     # Configure optimizer
     def _configure_optimizer(self, client_optimizer, model_parameters):
@@ -516,12 +533,14 @@ class DeepSpeedLight(Module):
                     "**** You are using ZeRO with an untested optimizer, proceed with caution *****"
                 )
             self.optimizer = self._configure_zero_optimizer(basic_optimizer)
+
         elif self.amp_enabled():
             assert not self.fp16_enabled(), "Cannot enable both amp with (legacy) fp16 mode"
             amp_params = self.amp_params()
             logger.info(f"Initializing AMP with these params: {amp_params}")
             self.module, self.optimizer = amp.initialize(self.module, basic_optimizer, **amp_params)
             self._broadcast_model()
+
         elif self.fp16_enabled():
             self.optimizer = self._configure_fp16_optimizer(basic_optimizer)
         else:
