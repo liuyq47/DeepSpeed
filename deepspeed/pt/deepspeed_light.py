@@ -133,13 +133,10 @@ class DeepSpeedLight(Module):
         if dist_init_required is None:
             dist_init_required = not dist.is_initialized()
 
-<<<<<<< HEAD
-        # self._mpi_check(args, dist_init_required)
-        #
-=======
+
         #self._mpi_check(args, dist_init_required)
 
->>>>>>> c8c6ac3d83a74a2aee9958f804545f2d4cc8a278
+
         # self.dist_backend = "nccl"
         # if dist_init_required:
         #     if not dist.is_initialized():
@@ -486,11 +483,8 @@ class DeepSpeedLight(Module):
 
         if self.mpu is None:
             #self.data_parallel_group = _initialize_parameter_parallel_groups()
-<<<<<<< HEAD
-            self.dp_world_size = dist.get_world_size()
-=======
+
             self.dp_world_size = herring.get_world_size()
->>>>>>> c8c6ac3d83a74a2aee9958f804545f2d4cc8a278
             self.mp_world_size = 1
             self.broadcast_src_rank = 0
         else:
@@ -502,13 +496,10 @@ class DeepSpeedLight(Module):
                 0)
             logger.info(f"global src_rank={self.broadcast_src_rank}")
 
-<<<<<<< HEAD
-        # if not self.amp_enabled():
-        #     self._broadcast_model()
-=======
+
         #if not self.amp_enabled():
         #    self._broadcast_model()
->>>>>>> c8c6ac3d83a74a2aee9958f804545f2d4cc8a278
+
 
     # Configure optimizer
     def _configure_optimizer(self, client_optimizer, model_parameters):
