@@ -517,13 +517,7 @@ class DeepSpeedLight(Module):
             assert not self.fp16_enabled(), "Cannot enable both amp with (legacy) fp16 mode"
             amp_params = self.amp_params()
             logger.info(f"Initializing AMP with these params: {amp_params}")
-            self.module, self.optimizer = amp.initialize(self.module, basic_optimizer, **amp_params)
-            # if self.train_batch_size() >=32:
-            #     logger.info(f"Configuring phase 1 loss scale")
-            #     amp._amp_state.loss_scalers[0]._loss_scale = 2**13
-            # else:
-            #     logger.info(f"Configuring phase 2 loss scale")
-            #     amp._amp_state.loss_scalers[0]._loss_scale = 2**10
+
             self._broadcast_model()
         elif self.fp16_enabled():
             self.optimizer = self._configure_fp16_optimizer(basic_optimizer)
@@ -555,7 +549,7 @@ class DeepSpeedLight(Module):
         initial_dynamic_scale = self.initial_dynamic_scale()
         dynamic_loss_args = self.dynamic_loss_scale_args()
         clip_grad = self.gradient_clipping()
-        if self.optimizer_name() == ADAM_OPTIMIZER:
+        if self.optimizer_name() == ADAM_OPTIMIZER or self.optimizer_name()==LANS_OPTIMIZER:
             if self.dynamic_loss_scale():
                 logger.info('Creating fp16 optimizer with dynamic loss scale')
                 timers = self.timers if self.wall_clock_breakdown() else None
