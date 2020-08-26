@@ -8,6 +8,7 @@ import warnings
 import torch.distributed as dist
 from torch.nn.modules import Module
 from torch.distributed.distributed_c10d import _get_global_rank
+from apex import amp
 
 from tensorboardX import SummaryWriter
 
@@ -21,7 +22,7 @@ from deepspeed.pt.fp16_optimizer import FP16_Optimizer
 from deepspeed.pt.fp16_unfused_optimizer import FP16_UnfusedOptimizer
 from deepspeed.pt.deepspeed_fused_lamb import FusedLamb
 from deepspeed.pt.deepspeed_config import DeepSpeedConfig, \
-    ADAM_OPTIMIZER, LAMB_OPTIMIZER, DEEPSPEED_OPTIMIZERS
+    ADAM_OPTIMIZER, LAMB_OPTIMIZER, LANS_OPTIMIZER, DEEPSPEED_OPTIMIZERS
 
 from deepspeed.pt.deepspeed_dataloader import DeepSpeedDataLoader
 from deepspeed.pt.deepspeed_constants import \
@@ -31,6 +32,9 @@ from deepspeed.pt.deepspeed_constants import \
 
 import deepspeed.pt.deepspeed_lr_schedules as lr_schedules
 from deepspeed.pt.deepspeed_csr_tensor import CSRTensor
+
+import herring.torch as herring
+dist.is_initialized = lambda: True
 
 MEMORY_OPT_ALLREDUCE_SIZE = 500000000
 SUMMARY_WRITER_DIR_NAME = "JobId"
@@ -120,32 +124,34 @@ class DeepSpeedLight(Module):
         self.gradient_average = True
         self.warn_unscaled_loss = True
         self.config_params = config_params
+        self.loaded_checkpoint_mp_world_size = None
+        self.loaded_checkpoint_dp_world_size = None
 
         if dist_init_required is None:
             dist_init_required = not dist.is_initialized()
 
-        self._mpi_check(args, dist_init_required)
-
-        self.dist_backend = "nccl"
-        if dist_init_required:
-            if not dist.is_initialized():
-                logger.info("Initializing torch distributed with backend: {}".format(
-                    self.dist_backend))
-                dist.init_process_group(backend=self.dist_backend)
-            else:
-                logger.warning(
-                    "Was given dist_init_required=True but detected that torch"
-                    "distributed was already initialized, cannot initialize twice.")
+        # self._mpi_check(args, dist_init_required)
+        #
+        # self.dist_backend = "nccl"
+        # if dist_init_required:
+        #     if not dist.is_initialized():
+        #         logger.info("Initializing torch distributed with backend: {}".format(
+        #             self.dist_backend))
+        #         dist.init_process_group(backend=self.dist_backend)
+        #     else:
+        #         logger.warning(
+        #             "Was given dist_init_required=True but detected that torch"
+        #             "distributed was already initialized, cannot initialize twice.")
 
         self._do_args_sanity_check(args)
         self._configure_with_arguments(args, mpu)
         self._do_sanity_check()
 
-        self.sample_count = 0
-        if self.tensorboard_enabled():
-            self.summary_writer = self.get_summary_writer()
-
         self._init_distributed(dist_init_required)
+
+        self.sample_count = 0
+        if self.tensorboard_enabled() and self.global_rank == 0:
+            self.summary_writer = self.get_summary_writer()
 
         # Configure distributed model
         self._configure_distributed_model(model)
@@ -157,6 +163,7 @@ class DeepSpeedLight(Module):
         self.tput_timer = ThroughputTimer(
             batch_size=self.train_micro_batch_size_per_gpu(),
             num_workers=self.dp_world_size,
+            steps_per_output=self.steps_per_print(),
             monitor_memory=False)
 
         self.training_dataloader = self.deepspeed_io(
@@ -224,7 +231,8 @@ class DeepSpeedLight(Module):
 
             if not dist_init_required and dist.is_initialized():
                 assert dist.get_rank() == rank, "MPI rank {} does not match torch rank {}".format(rank, dist.get_rank())
-                assert dist.get_world_size() == world_size, "MPI world size {} does not match torch world size {}".format(world_size, dist.get_world_size())
+                assert dist.get_world_size() == world_size, "MPI world size {} does not match torch world size {}".format(
+                    world_size, dist.get_world_size())
 
     def tensorboard_enabled(self):
         return self._config.tensorboard_enabled
@@ -288,9 +296,6 @@ class DeepSpeedLight(Module):
     def zero_overlap_comm(self):
         return self._config.zero_config.overlap_comm
 
-    def zero_max_elements_per_comm(self):
-        return self._config.zero_max_elements_per_comm
-
     def zero_optimization_stage(self):
         return self._config.zero_optimization_stage
 
@@ -306,11 +311,20 @@ class DeepSpeedLight(Module):
     def zero_contiguous_gradients(self):
         return self._config.zero_config.contiguous_gradients
 
+    def zero_load_from_fp32_weights(self):
+        return self._config.zero_config.load_from_fp32_weights
+
     def allgather_size(self):
         return self._config.allgather_size
 
     def fp16_enabled(self):
         return self._config.fp16_enabled
+
+    def amp_enabled(self):
+        return self._config.amp_enabled
+
+    def amp_params(self):
+        return self._config.amp_params
 
     def loss_scale(self):
         return self._config.loss_scale
@@ -366,7 +380,7 @@ class DeepSpeedLight(Module):
         if self.mpu:
             dp_rank = self.mpu.get_data_parallel_rank()
 
-        #only the first data parallel process needs to store the model checkpoint
+        # only the first data parallel process needs to store the model checkpoint
         self.save_non_zero_checkpoint = (dp_rank == 0)
 
         if self.zero_optimization():
@@ -397,8 +411,8 @@ class DeepSpeedLight(Module):
         if self.local_rank >= 0:
             torch.cuda.set_device(self.local_rank)
             self.device = torch.device("cuda", self.local_rank)
-            self.world_size = dist.get_world_size()
-            self.global_rank = dist.get_rank()
+            self.world_size = herring.get_world_size()
+            self.global_rank = herring.get_rank()
             logger.info("Set device to local rank {} within node.".format(
                 self.local_rank))
         else:
@@ -445,32 +459,39 @@ class DeepSpeedLight(Module):
             assert self.client_model_parameters, \
                 'DeepSpeed {} optimizer requires parameters in initialize() call'.format(self.optimizer_name())
 
-        if self.optimizer_name() == LAMB_OPTIMIZER:
+        if self.optimizer_name() == LAMB_OPTIMIZER or self.optimizer_name() == LANS_OPTIMIZER:
             assert self.dynamic_loss_scale(), \
                 'DeepSpeed {} optimizer requires dynamic loss scaling'.format(self.optimizer_name())
+
+    def _broadcast_model(self):
+        for p in self.module.parameters():
+            if torch.is_tensor(p):
+                dist.broadcast(p,
+                               self.broadcast_src_rank,
+                               group=self.data_parallel_group)
 
     def _configure_distributed_model(self, model):
         self.module = model
         if self.fp16_enabled():
             self.module.half()
         self.module.to(self.device)
+
         if self.mpu is None:
-            self.data_parallel_group = _initialize_parameter_parallel_groups()
+            #self.data_parallel_group = _initialize_parameter_parallel_groups()
             self.dp_world_size = dist.get_world_size()
-            src_rank = 0
+            self.mp_world_size = 1
+            self.broadcast_src_rank = 0
         else:
             self.data_parallel_group = self.mpu.get_data_parallel_group()
             self.dp_world_size = self.mpu.get_data_parallel_world_size()
-            src_rank = _get_global_rank(self.mpu.get_data_parallel_group(), 0)
-            logger.info(f"global src_rank={src_rank}")
-        for p in self.module.parameters():
-            if torch.is_tensor(p):
-                dist.broadcast(p, src_rank, group=self.data_parallel_group)
+            self.mp_world_size = self.mpu.get_model_parallel_world_size()
+            self.broadcast_src_rank = _get_global_rank(
+                self.mpu.get_data_parallel_group(),
+                0)
+            logger.info(f"global src_rank={self.broadcast_src_rank}")
 
-        # TODO: support new AMP optimizer
-        # self.module.half()
-        # self.module.to(self.local_rank)
-        #self.module, self.optimizer = amp.initialize(self.module, self.optimizer, opt_level="O2")
+        # if not self.amp_enabled():
+        #     self._broadcast_model()
 
     # Configure optimizer
     def _configure_optimizer(self, client_optimizer, model_parameters):
@@ -486,14 +507,21 @@ class DeepSpeedLight(Module):
         logger.info('DeepSpeed Basic Optimizer = {}'.format(basic_optimizer))
 
         if self.zero_optimization():
+            assert not self.amp_enabled(), "Amp and ZeRO are not currently compatible, please use (legacy) fp16 mode which performs similar to amp opt_mode=O2"
             if self.optimizer_name() != ADAM_OPTIMIZER:
                 assert self.zero_allow_untested_optimizer(), \
-                'You are using an untested ZeRO Optimizer. Please add <"zero_allow_untested_optimizer": true> in the configuration file to use it.'
+                    'You are using an untested ZeRO Optimizer. Please add <"zero_allow_untested_optimizer": true> in the configuration file to use it.'
 
                 logger.warning(
                     "**** You are using ZeRO with an untested optimizer, proceed with caution *****"
                 )
             self.optimizer = self._configure_zero_optimizer(basic_optimizer)
+        elif self.amp_enabled():
+            assert not self.fp16_enabled(), "Cannot enable both amp with (legacy) fp16 mode"
+            amp_params = self.amp_params()
+            logger.info(f"Initializing AMP with these params: {amp_params}")
+            self.module, self.optimizer = amp.initialize(self.module, basic_optimizer, **amp_params)
+            self._broadcast_model()
         elif self.fp16_enabled():
             self.optimizer = self._configure_fp16_optimizer(basic_optimizer)
         else:
@@ -512,6 +540,9 @@ class DeepSpeedLight(Module):
             optimizer = FusedAdam(model_parameters, **optimizer_parameters)
         elif self.optimizer_name() == LAMB_OPTIMIZER:
             optimizer = FusedLamb(model_parameters, **optimizer_parameters)
+        elif self.optimizer_name() == LANS_OPTIMIZER:
+            from apex.optimizers import FusedNesLAMB
+            optimizer = FusedNesLAMB(model_parameters, **optimizer_parameters)
         else:
             torch_optimizer = getattr(torch.optim, self.optimizer_name())
             optimizer = torch_optimizer(model_parameters, **optimizer_parameters)
@@ -521,7 +552,7 @@ class DeepSpeedLight(Module):
         initial_dynamic_scale = self.initial_dynamic_scale()
         dynamic_loss_args = self.dynamic_loss_scale_args()
         clip_grad = self.gradient_clipping()
-        if self.optimizer_name() == ADAM_OPTIMIZER:
+        if self.optimizer_name() == ADAM_OPTIMIZER or self.optimizer_name()==LANS_OPTIMIZER:
             if self.dynamic_loss_scale():
                 logger.info('Creating fp16 optimizer with dynamic loss scale')
                 timers = self.timers if self.wall_clock_breakdown() else None
@@ -573,7 +604,8 @@ class DeepSpeedLight(Module):
                 dp_process_group=self.data_parallel_group,
                 mpu=self.mpu)
         elif zero_stage == ZERO_OPTIMIZATION_GRADIENTS:
-            assert self.gradient_accumulation_steps() == 1, "ZeRO stage 2 does not support gradient accumulation, if you need gradient accumulation please use stage 1"
+            assert self.gradient_accumulation_steps(
+            ) == 1, "ZeRO stage 2 does not support gradient accumulation, if you need gradient accumulation please use stage 1"
             optimizer = FP16_DeepSpeedZeroOptimizer(
                 optimizer,
                 timers=self.timers,
@@ -624,8 +656,8 @@ class DeepSpeedLight(Module):
         data_parallel_world_size = None
         data_parallel_rank = None
         if self.mpu is not None:
-            data_parallel_world_size = mpu.get_data_parallel_world_size()
-            data_parallel_rank = mpu.get_data_parallel_rank()
+            data_parallel_world_size = self.mpu.get_data_parallel_world_size()
+            data_parallel_rank = self.mpu.get_data_parallel_rank()
 
         return DeepSpeedDataLoader(dataset=dataset,
                                    batch_size=batch_size,
@@ -748,12 +780,16 @@ class DeepSpeedLight(Module):
 
         if self.zero_optimization():
             self.optimizer.backward(loss)
+        elif self.amp_enabled():
+            # AMP requires delaying unscale when inside gradient accumulation boundaries
+            # https://nvidia.github.io/apex/advanced.html#gradient-accumulation-across-iterations
+            delay_unscale = not self.is_gradient_accumulation_boundary()
+            with amp.scale_loss(loss,
+                                self.optimizer,
+                                delay_unscale=delay_unscale) as scaled_loss:
+                scaled_loss.backward()
         elif self.fp16_enabled():
             self.optimizer.backward(loss)
-
-            # TODO: Use new AMP semantics as below
-            # with amp.scale_loss(loss, self.optimizer) as scaled_loss:
-            #    scaled_loss.backward()
         else:
             loss.backward()
 
@@ -804,14 +840,22 @@ class DeepSpeedLight(Module):
 
         if self.is_gradient_accumulation_boundary():
 
-            if not self.fp16_enabled() and self.gradient_clipping() > 0.0:
-                self.clip_fp32_gradients()
+            if self.gradient_clipping() > 0.0:
+                if not self.fp16_enabled() and not self.amp_enabled():
+                    self.clip_fp32_gradients()
+                elif self.amp_enabled():
+                    # AMP's recommended way of doing clipping
+                    # https://nvidia.github.io/apex/advanced.html#gradient-clipping
+                    master_params = amp.master_params(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(parameters=master_params,
+                                                   max_norm=self.gradient_clipping())
 
             self.optimizer.step()
 
             #zero grad in basic optimizer could be unreliable and may not exhibit
             #the behaviour that we want
-            if not self.zero_optimization() and not self.fp16_enabled():
+            if not self.zero_optimization() and not self.fp16_enabled(
+            ) and not self.amp_enabled():
                 self.zero_grad()
             else:
                 self.optimizer.zero_grad()
@@ -861,12 +905,24 @@ class DeepSpeedLight(Module):
             if self.is_gradient_accumulation_boundary():
                 if self.tensorboard_enabled():
                     if self.global_rank == 0:
-                        self.summary_events = [(f'Train/Samples/elapsed_time_ms_forward', self.timers('forward').elapsed(reset=False) * 1000.0, self.sample_count), \
-                                                (f'Train/Samples/elapsed_time_ms_backward', self.timers('backward').elapsed(reset=False) * 1000.0, self.sample_count), \
-                                                (f'Train/Samples/elapsed_time_ms_backward_inner', self.timers('backward_inner').elapsed(reset=False) * 1000.0, self.sample_count), \
-                                                (f'Train/Samples/elapsed_time_ms_backward_allreduce', self.timers('backward_allreduce').elapsed(reset=False) * 1000.0, self.sample_count), \
-                                                (f'Train/Samples/elapsed_time_ms_step', self.timers('step').elapsed(reset=False) * 1000.0, self.sample_count)
-                                                ]
+                        self.summary_events = [
+                            (f'Train/Samples/elapsed_time_ms_forward',
+                             self.timers('forward').elapsed(reset=False) * 1000.0,
+                             self.sample_count),
+                            (f'Train/Samples/elapsed_time_ms_backward',
+                             self.timers('backward').elapsed(reset=False) * 1000.0,
+                             self.sample_count),
+                            (f'Train/Samples/elapsed_time_ms_backward_inner',
+                             self.timers('backward_inner').elapsed(reset=False) * 1000.0,
+                             self.sample_count),
+                            (f'Train/Samples/elapsed_time_ms_backward_allreduce',
+                             self.timers('backward_allreduce').elapsed(reset=False) *
+                             1000.0,
+                             self.sample_count),
+                            (f'Train/Samples/elapsed_time_ms_step',
+                             self.timers('step').elapsed(reset=False) * 1000.0,
+                             self.sample_count)
+                        ]
                         for event in self.summary_events:  # write_summary_events
                             self.summary_writer.add_scalar(event[0], event[1], event[2])
                         self.summary_writer.flush()
@@ -957,7 +1013,17 @@ class DeepSpeedLight(Module):
     def buffered_allreduce_fallback(self, grads=None, elements_per_buffer=500000000):
         grads = []
         for param_name, param in self.module.named_parameters():
-            if param.grad is not None:
+            if param.grad is None:
+                # In cases where there is an imbalance of empty grads across
+                # ranks we must create empty grads, this will ensure that every
+                # rank is reducing the same size. In some cases it may make
+                # sense in the future to support the ability to average not
+                # w.r.t. world size but with a different value.
+                grads.append(
+                    torch.zeros(param.size(),
+                                dtype=param.dtype,
+                                device=param.device))
+            else:
                 grad_data = param.grad.data
                 if self.sparse_gradients_enabled(
                 ) and param_name in self.csr_tensor_module_names:
@@ -1039,17 +1105,18 @@ class DeepSpeedLight(Module):
     def load_module_state_dict(self, state_dict, strict=True):
         self.module.load_state_dict(state_dict, strict=strict)
 
-    def _get_zero_ckpt_name(self, checkpoints_path, tag):
-
-        mp_rank = 0 if self.mpu is None else self.mpu.get_model_parallel_rank()
-        pp_rank = torch.distributed.get_rank(group=self.optimizer.dp_process_group)
-
-        filename = 'zero_pp_rank_{}'.format(pp_rank)
+    def _get_rank_zero_ckpt_name(self, checkpoints_path, tag, mp_rank, dp_rank):
+        filename = 'zero_pp_rank_{}'.format(dp_rank)
         zero_ckpt_name = os.path.join(
             checkpoints_path,
             str(tag),
             filename + '_mp_rank_{:02d}'.format(mp_rank) + 'optim_states.pt')
         return zero_ckpt_name
+
+    def _get_zero_ckpt_name(self, checkpoints_path, tag):
+        mp_rank = 0 if self.mpu is None else self.mpu.get_model_parallel_rank()
+        pp_rank = torch.distributed.get_rank(group=self.optimizer.dp_process_group)
+        return self._get_rank_zero_ckpt_name(checkpoints_path, tag, mp_rank, pp_rank)
 
     def _get_ckpt_name(self, checkpoints_path, tag):
 
@@ -1117,8 +1184,12 @@ class DeepSpeedLight(Module):
         self.load_module_state_dict(state_dict=checkpoint['module'],
                                     strict=load_module_strict)
         if not self.zero_optimization():
-            self.optimizer.load_state_dict(checkpoint['optimizer'],
-                                           load_optimizer_states=load_optimizer_states)
+            if self.fp16_enabled():
+                self.optimizer.load_state_dict(
+                    checkpoint['optimizer'],
+                    load_optimizer_states=load_optimizer_states)
+            else:
+                self.optimizer.load_state_dict(checkpoint['optimizer'])
 
         if load_lr_scheduler_states and self.lr_scheduler is not None:
             self.lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
@@ -1126,13 +1197,17 @@ class DeepSpeedLight(Module):
         self.csr_tensor_module_names = checkpoint['csr_tensor_module_names']
         self.global_steps = checkpoint['global_steps']
         self.skipped_steps = checkpoint['skipped_steps']
+        self.loaded_checkpoint_mp_world_size = checkpoint['mp_world_size']
+        self.loaded_checkpoint_dp_world_size = checkpoint['dp_world_size']
         deepspeed_states = [
             'module',
             'optimizer',
             'lr_scheduler',
             'csr_tensor_module_names',
             'skipped_steps',
-            'global_steps'
+            'global_steps',
+            'dp_world_size',
+            'mp_world_size'
         ]
         client_state = {
             key: value
@@ -1143,18 +1218,72 @@ class DeepSpeedLight(Module):
         return load_path, client_state
 
     def _load_zero_checkpoint(self, load_dir, tag, load_optimizer_states=True):
-        zero_checkpoint_name = self._get_zero_ckpt_name(load_dir, tag)
+        zero_sd_list = self._get_all_zero_checkpoints(load_dir, tag)
+        if zero_sd_list is None:
+            return
 
-        if not os.path.exists(zero_checkpoint_name):
-            logger.warn(
-                'Client provided checkpoint load path: {} does not exist ... skip checkpoint load'
-                .format(zero_checkpoint_name))
+        self.optimizer.load_state_dict(
+            state_dict_list=zero_sd_list,
+            load_optimizer_states=load_optimizer_states,
+            load_from_fp32_weights=self.zero_load_from_fp32_weights())
+        print(
+            f'loading {len(zero_sd_list)} zero partition checkpoints for rank {self.global_rank}'
+        )
+
+    def _get_mp_rank_zero_checkpoint_names(self, load_dir, tag, mp_rank, dp_world_size):
+        zero_ckpt_names = []
+        for dp_rank in range(dp_world_size):
+            ckpt_name = self._get_rank_zero_ckpt_name(checkpoints_path=load_dir,
+                                                      tag=tag,
+                                                      mp_rank=mp_rank,
+                                                      dp_rank=dp_rank)
+            zero_ckpt_names.append(ckpt_name)
+
+        return zero_ckpt_names
+
+    def _get_all_zero_checkpoint_names(self,
+                                       load_dir,
+                                       tag,
+                                       mp_world_size,
+                                       dp_world_size):
+        zero_ckpt_names = []
+        for mp_rank in range(mp_world_size):
+            mp_rank_ckpt_names = self._get_mp_rank_zero_checkpoint_names(
+                load_dir=load_dir,
+                tag=tag,
+                mp_rank=mp_rank,
+                dp_world_size=dp_world_size)
+            zero_ckpt_names += mp_rank_ckpt_names
+
+        return zero_ckpt_names
+
+    def _get_all_zero_checkpoints(self, load_dir, tag):
+        mp_rank = 0 if self.mpu is None else self.mpu.get_model_parallel_rank()
+        zero_ckpt_names = self._get_mp_rank_zero_checkpoint_names(
+            load_dir=load_dir,
+            tag=tag,
+            mp_rank=mp_rank,
+            dp_world_size=self.loaded_checkpoint_dp_world_size)
+        invalid_zero_ckpt_paths = []
+        for ckpt_name in zero_ckpt_names:
+            if not os.path.exists(ckpt_name):
+                invalid_zero_ckpt_paths.append(ckpt_name)
+
+        if len(invalid_zero_ckpt_paths) > 0:
+            logging.warn(
+                f"Client provided zero checkpoint load paths: {invalid_zero_ckpt_paths} does not exist"
+            )
             return None
 
-        zero_sd = torch.load(zero_checkpoint_name, map_location='cpu')
-        self.optimizer.load_state_dict(zero_sd['optimizer_state_dict'],
-                                       load_optimizer_states=load_optimizer_states)
-        logger.info('loading zero checkpoint {}'.format(zero_checkpoint_name))
+        zero_sd_list = []
+        for ckpt_name in zero_ckpt_names:
+            zero_sd_list.append(torch.load(ckpt_name, map_location='cpu'))
+
+        zero_optimizer_sd = [sd['optimizer_state_dict'] for sd in zero_sd_list]
+        print(
+            f"successfully loaded {len(zero_optimizer_sd)} ZeRO state_dicts for rank {self.global_rank}"
+        )
+        return zero_optimizer_sd
 
     def save_checkpoint(self, save_dir, tag, client_state={}):
         r"""Save training checkpoint
@@ -1165,40 +1294,45 @@ class DeepSpeedLight(Module):
             client_state: Optional. State dictionary used for saving required training states in the client code.
         """
 
-        #This is to make sure the checkpoint names are created without collision
-        #There seems to be issue creating them in parallel
-        self._create_checkpoint_files(save_dir, tag)
+        # This is to make sure the checkpoint names are created without collision
+        # There seems to be issue creating them in parallel
 
         if self.save_non_zero_checkpoint:
+            self._create_checkpoint_file(save_dir, tag, False)
             self._save_checkpoint(save_dir, tag, client_state=client_state)
 
         if self.save_zero_checkpoint:
+            self._create_zero_checkpoint_files(save_dir, tag)
             self._save_zero_checkpoint(save_dir, tag)
 
         return True
 
-    def _create_checkpoint_files(self, save_dir, tag):
-        #checkpoint files are created sequentially
+    def _create_checkpoint_file(self, save_dir, tag, zero_checkpoint):
+        name_function = self._get_zero_ckpt_name if zero_checkpoint else self._get_ckpt_name
+        try:
+            checkpoint_name = name_function(save_dir, tag)
+            self._ensure_directory_exists(checkpoint_name)
+        except:
+            logger.error(f'Failed Saving model checkpoint to {save_dir} with tag {tag}')
+            return False
+
+        return True
+
+    def _create_zero_checkpoint_files(self, save_dir, tag):
+        success = True
+        # zero checkpoint files are created sequentially
         for rank in range(self.world_size):
             if rank == self.global_rank:
-                try:
-                    if self.save_non_zero_checkpoint:
-                        checkpoint_name = self._get_ckpt_name(save_dir, tag)
-                        self._ensure_directory_exists(checkpoint_name)
+                success = self._create_checkpoint_file(save_dir, tag, True)
 
-                    if self.save_zero_checkpoint:
-                        checkpoint_name = self._get_zero_ckpt_name(save_dir, tag)
-                        self._ensure_directory_exists(checkpoint_name)
-                except:
-                    logger.error(
-                        f'Failed Saving model checkpoint to {save_dir} with tag {tag}')
-                    return False
             dist.barrier()
+
+        return success
 
     def _save_checkpoint(self, save_dir, tag, client_state={}):
 
         save_path = self._get_ckpt_name(save_dir, tag)
-        #self._ensure_directory_exists(save_path)
+        # self._ensure_directory_exists(save_path)
 
         state = {
             'module':
@@ -1214,6 +1348,10 @@ class DeepSpeedLight(Module):
             self.skipped_steps,
             'global_steps':
             self.global_steps,
+            'dp_world_size':
+            self.dp_world_size,
+            'mp_world_size':
+            self.mp_world_size
         }
         state.update(client_state)
 
@@ -1222,7 +1360,7 @@ class DeepSpeedLight(Module):
 
     def _save_zero_checkpoint(self, save_path, tag):
         zero_checkpoint_name = self._get_zero_ckpt_name(save_path, tag)
-        #self._ensure_directory_exists(zero_checkpoint_name)
+        # self._ensure_directory_exists(zero_checkpoint_name)
         zero_sd = {'optimizer_state_dict': self.optimizer.state_dict()}
         torch.save(zero_sd, zero_checkpoint_name)
         logger.info('zero checkpoint saved {}'.format(zero_checkpoint_name))

@@ -176,11 +176,13 @@ fi
 
 # Build wheels
 if [ "$third_party_install" == "1" ]; then
-    echo "Checking out sub-module(s)"
-    git submodule update --init --recursive
-
+    #echo "Checking out sub-module(s)"
+    #git submodule update --init --recursive
+    cd third_party
+    git clone https://github.com/szhengac/apex.git
+    cd apex
     echo "Building apex wheel"
-    cd third_party/apex
+    #cd third_party/apex
 
     if [ "$apex_commit" != "" ]; then
         echo "Installing a non-standard version of apex at commit: $apex_commit"
@@ -189,7 +191,7 @@ if [ "$third_party_install" == "1" ]; then
     fi
 
     python setup.py -v --cpp_ext --cuda_ext bdist_wheel
-    cd -
+    cd ../../
 
     echo "Installing apex locally so that deepspeed will build"
     $PIP_SUDO pip uninstall -y apex
