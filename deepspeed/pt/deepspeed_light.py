@@ -33,6 +33,9 @@ from deepspeed.pt.deepspeed_constants import \
 import deepspeed.pt.deepspeed_lr_schedules as lr_schedules
 from deepspeed.pt.deepspeed_csr_tensor import CSRTensor
 
+import herring.torch as herring
+dist.is_initialized = lambda: True
+
 MEMORY_OPT_ALLREDUCE_SIZE = 500000000
 SUMMARY_WRITER_DIR_NAME = "JobId"
 
@@ -127,18 +130,18 @@ class DeepSpeedLight(Module):
         if dist_init_required is None:
             dist_init_required = not dist.is_initialized()
 
-        self._mpi_check(args, dist_init_required)
-
-        self.dist_backend = "nccl"
-        if dist_init_required:
-            if not dist.is_initialized():
-                logger.info("Initializing torch distributed with backend: {}".format(
-                    self.dist_backend))
-                dist.init_process_group(backend=self.dist_backend)
-            else:
-                logger.warning(
-                    "Was given dist_init_required=True but detected that torch"
-                    "distributed was already initialized, cannot initialize twice.")
+        # self._mpi_check(args, dist_init_required)
+        #
+        # self.dist_backend = "nccl"
+        # if dist_init_required:
+        #     if not dist.is_initialized():
+        #         logger.info("Initializing torch distributed with backend: {}".format(
+        #             self.dist_backend))
+        #         dist.init_process_group(backend=self.dist_backend)
+        #     else:
+        #         logger.warning(
+        #             "Was given dist_init_required=True but detected that torch"
+        #             "distributed was already initialized, cannot initialize twice.")
 
         self._do_args_sanity_check(args)
         self._configure_with_arguments(args, mpu)
@@ -408,8 +411,8 @@ class DeepSpeedLight(Module):
         if self.local_rank >= 0:
             torch.cuda.set_device(self.local_rank)
             self.device = torch.device("cuda", self.local_rank)
-            self.world_size = dist.get_world_size()
-            self.global_rank = dist.get_rank()
+            self.world_size = herring.get_world_size()
+            self.global_rank = herring.get_rank()
             logger.info("Set device to local rank {} within node.".format(
                 self.local_rank))
         else:
@@ -474,7 +477,7 @@ class DeepSpeedLight(Module):
         self.module.to(self.device)
 
         if self.mpu is None:
-            self.data_parallel_group = _initialize_parameter_parallel_groups()
+            #self.data_parallel_group = _initialize_parameter_parallel_groups()
             self.dp_world_size = dist.get_world_size()
             self.mp_world_size = 1
             self.broadcast_src_rank = 0
@@ -487,8 +490,8 @@ class DeepSpeedLight(Module):
                 0)
             logger.info(f"global src_rank={self.broadcast_src_rank}")
 
-        if not self.amp_enabled():
-            self._broadcast_model()
+        # if not self.amp_enabled():
+        #     self._broadcast_model()
 
     # Configure optimizer
     def _configure_optimizer(self, client_optimizer, model_parameters):
@@ -517,14 +520,7 @@ class DeepSpeedLight(Module):
             assert not self.fp16_enabled(), "Cannot enable both amp with (legacy) fp16 mode"
             amp_params = self.amp_params()
             logger.info(f"Initializing AMP with these params: {amp_params}")
-            #self.module, self.optimizer = amp.initialize(self.module, basic_optimizer, **amp_params)
-            #if phase1:
-            #if self.train_batch_size() >=32:
-            #    logger.info(f"Configuring phase 1 loss scale")
-            #    amp._amp_state.loss_scalers[0]._loss_scale = 2**13
-            #else:
-            #    logger.info(f"Configuring phase 2 loss scale")
-            #    amp._amp_state.loss_scalers[0]._loss_scale = 2**10
+            self.module, self.optimizer = amp.initialize(self.module, basic_optimizer, **amp_params)
             self._broadcast_model()
         elif self.fp16_enabled():
             self.optimizer = self._configure_fp16_optimizer(basic_optimizer)

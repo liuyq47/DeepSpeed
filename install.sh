@@ -191,7 +191,7 @@ if [ "$third_party_install" == "1" ]; then
     fi
 
     python setup.py -v --cpp_ext --cuda_ext bdist_wheel
-    cd -
+    cd ../../
 
     echo "Installing apex locally so that deepspeed will build"
     $PIP_SUDO pip uninstall -y apex
