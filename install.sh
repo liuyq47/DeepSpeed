@@ -181,6 +181,7 @@ if [ "$third_party_install" == "1" ]; then
     cd third_party
     git clone https://github.com/szhengac/apex.git
     cd apex
+    git checkout neslamb
     echo "Building apex wheel"
     #cd third_party/apex
 
